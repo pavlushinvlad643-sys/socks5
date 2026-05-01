@@ -1,34 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Improved SOCKS5 Proxy Server (clean architecture version)
-- safer buffer handling
-- cleaner state machine
-- better logging
-- typing support
-"""
-
-from twisted.internet import reactor, protocol, endpoints
+from twisted.internet import reactor, endpoints
 from twisted.internet.protocol import Protocol, Factory, ClientFactory
 from twisted.python import log
 
 import struct
 import socket
 import sys
-import time
 from enum import Enum
-from typing import Optional, Dict, Tuple
+from typing import Optional
 
-
-# =====================
-# CONSTANTS
-# =====================
 
 SOCKS5_VERSION = 5
-
 NO_AUTH = 0
-USER_PASS_AUTH = 2
 
 CMD_CONNECT = 1
 
@@ -42,86 +27,13 @@ REP_HOST_UNREACHABLE = 4
 REP_CONNECTION_REFUSED = 5
 
 
-# =====================
-# STATE MACHINE
-# =====================
-
 class ConnState(Enum):
     INIT = 0
-    AUTH = 1
-    READY = 2
-    RELAY = 3
+    READY = 1
+    RELAY = 2
 
 
-# =====================
-# DNS CACHE
-# =====================
-
-class DNSCache:
-    def __init__(self, ttl: int = 300):
-        self.cache: Dict[str, Tuple[str, float]] = {}
-        self.ttl = ttl
-
-    def get(self, host: str) -> Optional[str]:
-        entry = self.cache.get(host)
-        if not entry:
-            return None
-
-        ip, ts = entry
-        if time.time() - ts > self.ttl:
-            del self.cache[host]
-            return None
-
-        return ip
-
-    def set(self, host: str, ip: str):
-        self.cache[host] = (ip, time.time())
-
-
-# =====================
-# PARSER
-# =====================
-
-class SocksRequest:
-    def __init__(self, cmd: int, addr: str, port: int):
-        self.cmd = cmd
-        self.addr = addr
-        self.port = port
-
-
-def parse_request(data: bytes) -> SocksRequest:
-    if len(data) < 7:
-        raise ValueError("Packet too short")
-
-    version, cmd, _, atyp = struct.unpack("!BBBB", data[:4])
-    offset = 4
-
-    if version != SOCKS5_VERSION:
-        raise ValueError("Invalid version")
-
-    if atyp == ATYP_IPV4:
-        addr = socket.inet_ntoa(data[offset:offset+4])
-        offset += 4
-
-    elif atyp == ATYP_DOMAIN:
-        ln = data[offset]
-        offset += 1
-        addr = data[offset:offset+ln].decode()
-        offset += ln
-
-    elif atyp == ATYP_IPV6:
-        addr = socket.inet_ntop(socket.AF_INET6, data[offset:offset+16])
-        offset += 16
-
-    else:
-        raise ValueError("Unsupported ATYP")
-
-    port = struct.unpack("!H", data[offset:offset+2])[0]
-
-    return SocksRequest(cmd, addr, port)
-
-
-def build_reply(rep: int, addr="0.0.0.0", port=0) -> bytes:
+def build_reply(rep, addr="0.0.0.0", port=0):
     try:
         packed = socket.inet_aton(addr)
         atyp = ATYP_IPV4
@@ -132,29 +44,18 @@ def build_reply(rep: int, addr="0.0.0.0", port=0) -> bytes:
     return struct.pack("!BBBB", SOCKS5_VERSION, rep, 0, atyp) + packed + struct.pack("!H", port)
 
 
-# =====================
-# MAIN PROTOCOL
-# =====================
-
 class SOCKS5Server(Protocol):
 
-    def __init__(self, dns_cache: DNSCache):
+    def __init__(self):
         self.state = ConnState.INIT
         self.buffer = b''
         self.remote: Optional[Protocol] = None
-        self.dns_cache = dns_cache
 
     def connectionMade(self):
         peer = self.transport.getPeer()
-        log.msg(f"[+] Client {peer.host}:{peer.port}")
+        log.msg(f"[+] {peer.host}:{peer.port}")
 
-        try:
-            sock = self.transport.getHandle()
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except Exception as e:
-            log.msg(f"[WARN] sockopt: {e}")
-
-    def dataReceived(self, data: bytes):
+    def dataReceived(self, data):
         self.buffer += data
 
         while True:
@@ -176,10 +77,10 @@ class SOCKS5Server(Protocol):
                 break
 
     # =====================
-    # HANDLERS
+    # FIXED HANDSHAKE
     # =====================
 
-    def handle_greeting(self) -> bool:
+    def handle_greeting(self):
         if len(self.buffer) < 2:
             return False
 
@@ -188,73 +89,64 @@ class SOCKS5Server(Protocol):
         if len(self.buffer) < 2 + nmethods:
             return False
 
-        methods = self.buffer[2:2+nmethods]
-        self.buffer = self.buffer[2+nmethods:]
+        methods = self.buffer[2:2 + nmethods]
+        self.buffer = self.buffer[2 + nmethods:]
+
+        if version != SOCKS5_VERSION:
+            self.transport.loseConnection()
+            return False
 
         if NO_AUTH in methods:
             self.transport.write(struct.pack("!BB", SOCKS5_VERSION, NO_AUTH))
             self.state = ConnState.READY
-        else:
-            self.transport.loseConnection()
+            return True
 
-        return True
+        self.transport.write(struct.pack("!BB", SOCKS5_VERSION, 0xFF))
+        self.transport.loseConnection()
+        return False
 
-    def handle_request(self) -> bool:
+    # =====================
+    # REQUEST
+    # =====================
+
+    def handle_request(self):
         if len(self.buffer) < 7:
             return False
 
         try:
-            req = parse_request(self.buffer)
-        except Exception as e:
-            log.msg(f"[ERROR] parse: {e}")
+            version, cmd, _, atyp = struct.unpack("!BBBB", self.buffer[:4])
+            offset = 4
+
+            if atyp == ATYP_IPV4:
+                addr = socket.inet_ntoa(self.buffer[offset:offset+4])
+                offset += 4
+
+            elif atyp == ATYP_DOMAIN:
+                ln = self.buffer[offset]
+                offset += 1
+                addr = self.buffer[offset:offset+ln].decode()
+                offset += ln
+
+            elif atyp == ATYP_IPV6:
+                addr = socket.inet_ntop(socket.AF_INET6, self.buffer[offset:offset+16])
+                offset += 16
+
+            else:
+                raise Exception()
+
+            port = struct.unpack("!H", self.buffer[offset:offset+2])[0]
+
+        except Exception:
             self.transport.write(build_reply(REP_GENERAL_FAILURE))
             self.transport.loseConnection()
             return False
 
         self.buffer = b''
 
-        log.msg(f"[REQ] {req.addr}:{req.port}")
+        log.msg(f"[REQ] {addr}:{port}")
 
-        self.resolve_and_connect(req)
+        reactor.connectTCP(addr, port, RemoteFactory(self))
         return True
-
-    # =====================
-    # CONNECT
-    # =====================
-
-    def resolve_and_connect(self, req: SocksRequest):
-        if self.is_ip(req.addr):
-            self.connect(req.addr, req.port)
-            return
-
-        cached = self.dns_cache.get(req.addr)
-        if cached:
-            self.connect(cached, req.port)
-            return
-
-        def resolved(ip):
-            self.dns_cache.set(req.addr, ip)
-            self.connect(ip, req.port)
-
-        d = reactor.resolve(req.addr)
-        d.addCallback(resolved)
-        d.addErrback(lambda _: self.fail())
-
-    def connect(self, host: str, port: int):
-        factory = RemoteFactory(self)
-        reactor.connectTCP(host, port, factory)
-
-    def fail(self):
-        self.transport.write(build_reply(REP_HOST_UNREACHABLE))
-        self.transport.loseConnection()
-
-    @staticmethod
-    def is_ip(addr: str) -> bool:
-        try:
-            socket.inet_aton(addr)
-            return True
-        except OSError:
-            return False
 
     def start_relay(self, remote):
         self.remote = remote
@@ -262,19 +154,14 @@ class SOCKS5Server(Protocol):
 
         peer = remote.getPeer()
         self.transport.write(build_reply(REP_SUCCESS, peer.host, peer.port))
-        log.msg(f"[OK] Connected {peer.host}:{peer.port}")
 
     def connectionLost(self, reason):
         if self.remote:
             self.remote.loseConnection()
 
 
-# =====================
-# REMOTE SIDE
-# =====================
-
 class RemoteFactory(ClientFactory):
-    def __init__(self, server: SOCKS5Server):
+    def __init__(self, server):
         self.server = server
 
     def buildProtocol(self, addr):
@@ -286,7 +173,7 @@ class RemoteFactory(ClientFactory):
 
 
 class RemoteClient(Protocol):
-    def __init__(self, server: SOCKS5Server):
+    def __init__(self, server):
         self.server = server
 
     def connectionMade(self):
@@ -301,21 +188,10 @@ class RemoteClient(Protocol):
             self.server.transport.loseConnection()
 
 
-# =====================
-# FACTORY
-# =====================
-
 class SOCKSFactory(Factory):
-    def __init__(self):
-        self.dns_cache = DNSCache()
-
     def buildProtocol(self, addr):
-        return SOCKS5Server(self.dns_cache)
+        return SOCKS5Server()
 
-
-# =====================
-# MAIN
-# =====================
 
 def main():
     log.startLogging(sys.stdout)
@@ -323,7 +199,7 @@ def main():
     port = 1080
     endpoint = endpoints.TCP4ServerEndpoint(reactor, port)
 
-    log.msg(f"🚀 SOCKS5 running on :{port}")
+    log.msg(f"SOCKS5 running on :{port}")
 
     endpoint.listen(SOCKSFactory())
     reactor.run()
