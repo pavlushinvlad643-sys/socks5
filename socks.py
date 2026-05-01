@@ -1,140 +1,87 @@
 #!/usr/bin/env python3
 
-from twisted.internet import reactor, protocol
-from twisted.internet.protocol import DatagramProtocol
-import struct
 import socket
-import sys
+import threading
+import struct
 
-SOCKS_VERSION = 5
+BUFFER_SIZE = 4096
 
-class UDPRelay(DatagramProtocol):
-    def __init__(self, client_addr):
-        self.client_addr = client_addr
+def forward(source, destination):
+    try:
+        while True:
+            data = source.recv(BUFFER_SIZE)
+            if not data:
+                break
+            destination.sendall(data)
+    except:
+        pass
+    finally:
+        source.close()
+        destination.close()
 
-    def datagramReceived(self, data, addr):
-        if addr == self.client_addr:
-            # from client → internet
-            try:
-                _, _, atyp = struct.unpack("!HBB", data[:4])
-                offset = 4
 
-                if atyp == 1:  # IPv4
-                    dst_addr = socket.inet_ntoa(data[offset:offset+4])
-                    offset += 4
-                elif atyp == 3:  # domain
-                    length = data[offset]
-                    offset += 1
-                    dst_addr = data[offset:offset+length].decode()
-                    offset += length
-                else:
-                    return
+def handle_client(client):
 
-                dst_port = struct.unpack("!H", data[offset:offset+2])[0]
-                payload = data[offset+2:]
+    try:
+        # handshake
+        data = client.recv(262)
+        client.sendall(b"\x05\x00")
 
-                self.transport.write(payload, (dst_addr, dst_port))
+        # request
+        data = client.recv(4)
+        ver, cmd, _, atyp = struct.unpack("!BBBB", data)
 
-            except:
-                pass
+        if atyp == 1:  # IPv4
+            addr = socket.inet_ntoa(client.recv(4))
+        elif atyp == 3:  # domain
+            length = client.recv(1)[0]
+            addr = client.recv(length).decode()
         else:
-            # from internet → client
-            try:
-                addr_bytes = socket.inet_aton(addr[0])
-                header = struct.pack("!HBB", 0, 0, 1)
-                header += addr_bytes
-                header += struct.pack("!H", addr[1])
-
-                self.transport.write(header + data, self.client_addr)
-            except:
-                pass
-
-
-class SOCKS5(protocol.Protocol):
-
-    def connectionMade(self):
-        self.state = "init"
-        self.client = self.transport.getPeer()
-        print(f"[+] Client {self.client.host}:{self.client.port}")
-
-    def dataReceived(self, data):
-
-        if self.state == "init":
-            # greeting
-            self.transport.write(struct.pack("!BB", 5, 0))
-            self.state = "request"
-
-        elif self.state == "request":
-            version, cmd, _, atyp = struct.unpack("!BBBB", data[:4])
-            offset = 4
-
-            if atyp == 1:
-                addr = socket.inet_ntoa(data[offset:offset+4])
-                offset += 4
-            elif atyp == 3:
-                length = data[offset]
-                offset += 1
-                addr = data[offset:offset+length].decode()
-                offset += length
-
-            port = struct.unpack("!H", data[offset:offset+2])[0]
-
-            if cmd == 1:
-                self.handle_tcp(addr, port)
-            elif cmd == 3:
-                self.handle_udp()
-
-    def handle_tcp(self, addr, port):
-        print(f"[TCP] {addr}:{port}")
-
-        try:
-            remote = socket.create_connection((addr, port))
-        except:
-            self.transport.loseConnection()
+            client.close()
             return
+
+        port = struct.unpack('!H', client.recv(2))[0]
+
+        print(f"[CONNECT] {addr}:{port}")
+
+        remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        remote.connect((addr, port))
 
         bind_addr = remote.getsockname()
 
-        reply = struct.pack("!BBBB", 5, 0, 0, 1)
+        reply = b"\x05\x00\x00\x01"
         reply += socket.inet_aton(bind_addr[0])
         reply += struct.pack("!H", bind_addr[1])
 
-        self.transport.write(reply)
+        client.sendall(reply)
 
-        self.state = "stream"
+        # FULL DUPLEX (вот это ключ!)
+        t1 = threading.Thread(target=forward, args=(client, remote))
+        t2 = threading.Thread(target=forward, args=(remote, client))
 
-        self.remote = remote
-        reactor.addReader(self)
+        t1.start()
+        t2.start()
 
-    def doRead(self):
-        try:
-            data = self.remote.recv(4096)
-            if data:
-                self.transport.write(data)
-        except:
-            self.transport.loseConnection()
-
-    def handle_udp(self):
-        port = reactor.listenUDP(0, UDPRelay(self.client)).getHost().port
-
-        reply = struct.pack("!BBBB", 5, 0, 0, 1)
-        reply += socket.inet_aton("0.0.0.0")
-        reply += struct.pack("!H", port)
-
-        self.transport.write(reply)
-
-        print(f"[UDP] relay on port {port}")
+    except Exception as e:
+        print("ERROR:", e)
+        client.close()
 
 
-class Factory(protocol.Factory):
-    def buildProtocol(self, addr):
-        return SOCKS5()
+def main():
+    host = "0.0.0.0"
+    port = 1081  # новый порт
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind((host, port))
+    server.listen(128)
+
+    print(f"[OK] SOCKS5 работает на {host}:{port}")
+
+    while True:
+        client, addr = server.accept()
+        print(f"[NEW] {addr}")
+        threading.Thread(target=handle_client, args=(client,)).start()
 
 
 if __name__ == "__main__":
-    port = 1081   # ⚠️ НОВЫЙ ПОРТ
-
-    reactor.listenTCP(port, Factory())
-    print(f"SOCKS5 running on 0.0.0.0:{port}")
-
-    reactor.run()
+    main()
