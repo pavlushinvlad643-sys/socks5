@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
-from twisted.internet import reactor, endpoints
-from twisted.internet.protocol import Protocol, Factory, ClientFactory, DatagramProtocol
+from twisted.internet import reactor, protocol
+from twisted.internet.protocol import Protocol, Factory, DatagramProtocol
 from twisted.python import log
 
 import struct
 import socket
 import sys
-from enum import Enum
-from typing import Optional
+import time
 
-
+# SOCKS5 constants
 SOCKS5_VERSION = 5
 NO_AUTH = 0
-
 CMD_CONNECT = 1
 CMD_UDP_ASSOCIATE = 3
 
@@ -23,297 +20,190 @@ ATYP_DOMAIN = 3
 ATYP_IPV6 = 4
 
 REP_SUCCESS = 0
-REP_GENERAL_FAILURE = 1
-REP_HOST_UNREACHABLE = 4
-REP_CONNECTION_REFUSED = 5
+REP_FAIL = 1
 
 
-class ConnState(Enum):
-    INIT = 0
-    READY = 1
-    RELAY = 2
-    UDP = 3
-
-
-def build_reply(rep, addr="0.0.0.0", port=0):
-    try:
-        packed = socket.inet_aton(addr)
-        atyp = ATYP_IPV4
-    except OSError:
-        packed = socket.inet_pton(socket.AF_INET6, addr)
-        atyp = ATYP_IPV6
-
-    return struct.pack("!BBBB", SOCKS5_VERSION, rep, 0, atyp) + packed + struct.pack("!H", port)
-
-
-# =========================
-# UDP RELAY
-# =========================
+# ================= UDP RELAY =================
 
 class UDPRelay(DatagramProtocol):
     def __init__(self):
         self.client_addr = None
+        self.nat = {}  # (ip, port) -> client
 
     def datagramReceived(self, data, addr):
-        if self.client_addr is None:
-            self.client_addr = addr
-            log.msg(f"[UDP] client {addr}")
-
-        if addr == self.client_addr:
-            self.handle_client(data)
-        else:
-            self.handle_remote(data, addr)
-
-    def handle_client(self, data):
         try:
-            rsv, frag, atyp = struct.unpack("!HBB", data[:4])
-            if frag != 0:
-                return
+            if self.client_addr is None:
+                self.client_addr = addr
+                log.msg(f"[UDP] Client: {addr}")
 
-            offset = 4
-
-            if atyp == ATYP_IPV4:
-                dst = socket.inet_ntoa(data[offset:offset+4])
-                offset += 4
-
-            elif atyp == ATYP_DOMAIN:
-                ln = data[offset]
-                offset += 1
-                dst = data[offset:offset+ln].decode()
-                offset += ln
-
-            elif atyp == ATYP_IPV6:
-                dst = socket.inet_ntop(socket.AF_INET6, data[offset:offset+16])
-                offset += 16
-
+            if addr == self.client_addr:
+                self.from_client(data)
             else:
-                return
-
-            port = struct.unpack("!H", data[offset:offset+2])[0]
-            payload = data[offset+2:]
-
-            self.transport.write(payload, (dst, port))
+                self.from_remote(data, addr)
 
         except Exception as e:
-            log.msg(f"[UDP] error {e}")
+            log.msg(f"[UDP ERROR] {e}")
 
-    def handle_remote(self, data, addr):
+    def from_client(self, data):
+        if len(data) < 10:
+            return
+
+        rsv, frag, atyp = struct.unpack("!HBB", data[:4])
+        if frag != 0:
+            return
+
+        offset = 4
+
+        if atyp == ATYP_IPV4:
+            dst_addr = socket.inet_ntoa(data[offset:offset+4])
+            offset += 4
+        elif atyp == ATYP_DOMAIN:
+            ln = data[offset]
+            offset += 1
+            dst_addr = data[offset:offset+ln].decode()
+            offset += ln
+        elif atyp == ATYP_IPV6:
+            dst_addr = socket.inet_ntop(socket.AF_INET6, data[offset:offset+16])
+            offset += 16
+        else:
+            return
+
+        dst_port = struct.unpack("!H", data[offset:offset+2])[0]
+        payload = data[offset+2:]
+
+        # NAT
+        self.nat[(dst_addr, dst_port)] = self.client_addr
+
+        self.transport.write(payload, (dst_addr, dst_port))
+        log.msg(f"[UDP] → {dst_addr}:{dst_port} ({len(payload)}B)")
+
+    def from_remote(self, data, addr):
+        client = self.nat.get(addr)
+
+        if not client:
+            log.msg(f"[UDP] Unknown remote {addr}")
+            return
+
         try:
-            try:
-                addr_bytes = socket.inet_aton(addr[0])
-                atyp = ATYP_IPV4
-            except:
-                addr_bytes = socket.inet_pton(socket.AF_INET6, addr[0])
-                atyp = ATYP_IPV6
+            addr_bytes = socket.inet_aton(addr[0])
+            atyp = ATYP_IPV4
+        except:
+            atyp = ATYP_DOMAIN
+            addr_bytes = bytes([len(addr[0])]) + addr[0].encode()
 
-            header = struct.pack("!HBB", 0, 0, atyp)
-            header += addr_bytes
-            header += struct.pack("!H", addr[1])
+        header = struct.pack("!HBB", 0, 0, atyp)
+        header += addr_bytes
+        header += struct.pack("!H", addr[1])
 
-            packet = header + data
-            self.transport.write(packet, self.client_addr)
-
-        except Exception as e:
-            log.msg(f"[UDP] error {e}")
+        self.transport.write(header + data, client)
+        log.msg(f"[UDP] ← {addr}")
 
 
-# =========================
-# MAIN SERVER
-# =========================
+# ================= TCP =================
 
-class SOCKS5Server(Protocol):
-
-    def __init__(self):
-        self.state = ConnState.INIT
-        self.buffer = b''
-        self.remote: Optional[Protocol] = None
-        self.udp_port = None
+class Remote(Protocol):
+    def __init__(self, client):
+        self.client = client
 
     def connectionMade(self):
-        peer = self.transport.getPeer()
-        log.msg(f"[+] {peer.host}:{peer.port}")
+        self.client.transport.write(self.client.reply_success())
+        log.msg("[TCP] Connected")
+
+    def dataReceived(self, data):
+        self.client.transport.write(data)
+
+    def connectionLost(self, reason):
+        self.client.transport.loseConnection()
+
+
+class SOCKS5(Protocol):
+    def __init__(self):
+        self.state = 0
+        self.buffer = b''
+        self.remote = None
 
     def dataReceived(self, data):
         self.buffer += data
 
-        while True:
-            if self.state == ConnState.INIT:
-                if not self.handle_greeting():
-                    break
+        if self.state == 0:
+            if len(self.buffer) < 2:
+                return
+            self.transport.write(struct.pack("!BB", 5, 0))
+            self.buffer = b''
+            self.state = 1
 
-            elif self.state == ConnState.READY:
-                if not self.handle_request():
-                    break
+        elif self.state == 1:
+            if len(self.buffer) < 7:
+                return
 
-            elif self.state == ConnState.RELAY:
-                if self.remote:
-                    self.remote.transport.write(self.buffer)
-                    self.buffer = b''
-                break
-
-            else:
-                break
-
-    # =====================
-    # HANDSHAKE
-    # =====================
-
-    def handle_greeting(self):
-        if len(self.buffer) < 2:
-            return False
-
-        ver, nmethods = struct.unpack("!BB", self.buffer[:2])
-
-        if len(self.buffer) < 2 + nmethods:
-            return False
-
-        methods = self.buffer[2:2+nmethods]
-        self.buffer = self.buffer[2+nmethods:]
-
-        if NO_AUTH in methods:
-            self.transport.write(struct.pack("!BB", SOCKS5_VERSION, NO_AUTH))
-            self.state = ConnState.READY
-            return True
-
-        self.transport.write(struct.pack("!BB", SOCKS5_VERSION, 0xFF))
-        self.transport.loseConnection()
-        return False
-
-    # =====================
-    # REQUEST
-    # =====================
-
-    def handle_request(self):
-        if len(self.buffer) < 7:
-            return False
-
-        try:
             ver, cmd, _, atyp = struct.unpack("!BBBB", self.buffer[:4])
             offset = 4
 
             if atyp == ATYP_IPV4:
                 addr = socket.inet_ntoa(self.buffer[offset:offset+4])
                 offset += 4
-
             elif atyp == ATYP_DOMAIN:
                 ln = self.buffer[offset]
                 offset += 1
                 addr = self.buffer[offset:offset+ln].decode()
                 offset += ln
-
-            elif atyp == ATYP_IPV6:
-                addr = socket.inet_ntop(socket.AF_INET6, self.buffer[offset:offset+16])
-                offset += 16
-
             else:
-                raise Exception()
+                return
 
             port = struct.unpack("!H", self.buffer[offset:offset+2])[0]
 
-        except Exception:
-            self.transport.write(build_reply(REP_GENERAL_FAILURE))
-            self.transport.loseConnection()
-            return False
+            log.msg(f"[REQ] {addr}:{port}")
 
-        self.buffer = b''
+            if cmd == CMD_CONNECT:
+                self.connect(addr, port)
 
-        if cmd == CMD_CONNECT:
-            reactor.connectTCP(addr, port, RemoteFactory(self))
+            elif cmd == CMD_UDP_ASSOCIATE:
+                self.udp_associate()
 
-        elif cmd == CMD_UDP_ASSOCIATE:
-            self.start_udp()
+            self.buffer = b''
 
-        else:
-            self.transport.write(build_reply(REP_GENERAL_FAILURE))
+    def connect(self, host, port):
+        factory = protocol.ClientFactory()
 
-        return True
+        def build(_):
+            return Remote(self)
 
-    # =====================
-    # UDP SUPPORT
-    # =====================
+        factory.buildProtocol = build
 
-    def start_udp(self):
+        reactor.connectTCP(host, port, factory)
+
+    def udp_associate(self):
         relay = UDPRelay()
         port = reactor.listenUDP(0, relay)
-        udp_port = port.getHost().port
+        p = port.getHost().port
 
-        log.msg(f"[UDP] listening {udp_port}")
+        log.msg(f"[UDP] Started on {p}")
 
-        self.transport.write(build_reply(REP_SUCCESS, "0.0.0.0", udp_port))
-        self.state = ConnState.UDP
+        self.transport.write(self.reply_success("0.0.0.0", p))
 
-    # =====================
-    # TCP RELAY
-    # =====================
+    def reply_success(self, host="0.0.0.0", port=0):
+        return struct.pack("!BBBB", 5, 0, 0, 1) + socket.inet_aton(host) + struct.pack("!H", port)
 
-    def start_relay(self, remote):
-        self.remote = remote
-        self.state = ConnState.RELAY
-
-        peer = remote.getPeer()
-        self.transport.write(build_reply(REP_SUCCESS, peer.host, peer.port))
-
-    def connectionLost(self, reason):
-        if self.remote:
-            self.remote.loseConnection()
-
-
-# =====================
-# REMOTE
-# =====================
-
-class RemoteFactory(ClientFactory):
-    def __init__(self, server):
-        self.server = server
-
-    def buildProtocol(self, addr):
-        return RemoteClient(self.server)
-
-    def clientConnectionFailed(self, connector, reason):
-        self.server.transport.write(build_reply(REP_CONNECTION_REFUSED))
-        self.server.transport.loseConnection()
-
-
-class RemoteClient(Protocol):
-    def __init__(self, server):
-        self.server = server
-
-    def connectionMade(self):
-        self.server.start_relay(self.transport)
-
-    def dataReceived(self, data):
-        if self.server.transport.connected:
-            self.server.transport.write(data)
-
-    def connectionLost(self, reason):
-        if self.server.transport.connected:
-            self.server.transport.loseConnection()
-
-
-# =====================
-# FACTORY
-# =====================
 
 class SOCKSFactory(Factory):
     def buildProtocol(self, addr):
-        return SOCKS5Server()
+        log.msg(f"[NEW] {addr.host}:{addr.port}")
+        return SOCKS5()
 
 
-# =====================
-# MAIN
-# =====================
-
-def main():
-    log.startLogging(sys.stdout)
-
-    port = 1080
-    endpoint = endpoints.TCP4ServerEndpoint(reactor, port)
-
-    log.msg(f"SOCKS5 + UDP running on :{port}")
-
-    endpoint.listen(SOCKSFactory())
-    reactor.run()
-
+# ================= MAIN =================
 
 if __name__ == "__main__":
-    main()
+    log.startLogging(sys.stdout)
+
+    PORT = 1080
+
+    reactor.listenTCP(PORT, SOCKSFactory())
+
+    log.msg("="*50)
+    log.msg("SOCKS5 + UDP (iSH READY)")
+    log.msg(f"PORT: {PORT}")
+    log.msg("Supports Discord / TeamSpeak")
+    log.msg("="*50)
+
+    reactor.run()
