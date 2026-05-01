@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from twisted.internet import reactor, protocol
+from twisted.internet import reactor
 from twisted.internet.protocol import Protocol, Factory, DatagramProtocol, ClientFactory
 import struct
 import socket
@@ -14,21 +14,20 @@ CMD_UDP_ASSOCIATE = 0x03
 
 ATYP_IPV4 = 0x01
 ATYP_DOMAIN = 0x03
-ATYP_IPV6 = 0x04
 
 REP_SUCCESS = 0x00
 REP_GENERAL_FAILURE = 0x01
 REP_COMMAND_NOT_SUPPORTED = 0x07
 
 
-# ========================= UDP RELAY =========================
+# ================= UDP RELAY =================
 
 class UDPRelay(DatagramProtocol):
     def __init__(self):
         self.client_addr = None
         self.client_ip = None
-        self.sessions = {}  # (dst_ip, dst_port) -> client_addr
-        self.last_activity = time.time()
+        self.sessions = {}
+        self.last_cleanup = time.time()
 
     def datagramReceived(self, data, addr):
         try:
@@ -46,7 +45,7 @@ class UDPRelay(DatagramProtocol):
 
         if self.client_addr is None:
             self.client_addr = addr
-            print("[UDP] client locked:", addr)
+            print("[UDP] client:", addr)
 
         try:
             rsv, frag, atyp = struct.unpack("!HBB", data[:4])
@@ -98,18 +97,25 @@ class UDPRelay(DatagramProtocol):
             print("[UDP REMOTE ERROR]", e)
 
 
-# ========================= TCP RELAY =========================
+# ================= TCP RELAY =================
 
 class Remote(Protocol):
     def connectionMade(self):
+        if not hasattr(self.factory, "client") or self.factory.client is None:
+            print("[TCP ERROR] client None")
+            self.transport.loseConnection()
+            return
+
         self.factory.client.remote = self.transport
         self.factory.client.send_reply(REP_SUCCESS)
 
     def dataReceived(self, data):
-        self.factory.client.transport.write(data)
+        if self.factory.client and self.factory.client.transport.connected:
+            self.factory.client.transport.write(data)
 
     def connectionLost(self, reason):
-        self.factory.client.transport.loseConnection()
+        if self.factory.client and self.factory.client.transport.connected:
+            self.factory.client.transport.loseConnection()
 
 
 class RemoteFactory(ClientFactory):
@@ -119,14 +125,18 @@ class RemoteFactory(ClientFactory):
         self.port = port
 
     def buildProtocol(self, addr):
-        return Remote()
+        proto = Remote()
+        proto.factory = self
+        return proto
 
     def clientConnectionFailed(self, connector, reason):
-        self.client.send_reply(REP_GENERAL_FAILURE)
-        self.client.transport.loseConnection()
+        print("[TCP FAIL]", reason)
+        if self.client:
+            self.client.send_reply(REP_GENERAL_FAILURE)
+            self.client.transport.loseConnection()
 
 
-# ========================= SOCKS SERVER =========================
+# ================= SOCKS5 =================
 
 class SOCKS5(Protocol):
 
@@ -139,6 +149,7 @@ class SOCKS5(Protocol):
     def dataReceived(self, data):
         self.buffer += data
 
+        # handshake
         if self.state == 0:
             if len(self.buffer) < 3:
                 return
@@ -146,6 +157,7 @@ class SOCKS5(Protocol):
             self.buffer = b""
             self.state = 1
 
+        # request
         elif self.state == 1:
             if len(self.buffer) < 10:
                 return
@@ -186,7 +198,7 @@ class SOCKS5(Protocol):
             port = reactor.listenUDP(0, self.udp)
             udp_port = port.getHost().port
 
-            # ❗ КЛЮЧЕВОЙ ФИКС
+            # КЛЮЧЕВОЙ ФИКС
             self.send_reply(REP_SUCCESS, self.client_addr.host, udp_port)
 
             print("[UDP READY]", self.client_addr.host, udp_port)
@@ -209,14 +221,14 @@ class SOCKS5(Protocol):
         self.transport.write(reply)
 
 
-class Factory(Factory):
+class SOCKSFactory(Factory):
     def buildProtocol(self, addr):
         return SOCKS5()
 
 
-# ========================= RUN =========================
+# ================= RUN =================
 
 if __name__ == "__main__":
-    print("🚀 SOCKS5 (UDP FIXED) STARTED ON :1098")
-    reactor.listenTCP(1098, Factory())
+    print("🚀 SOCKS5 WORKING (TCP+UDP) :1098")
+    reactor.listenTCP(1098, SOCKSFactory())
     reactor.run()
