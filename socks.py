@@ -7,9 +7,7 @@ from twisted.python import log
 import struct
 import socket
 import sys
-import time
 
-# SOCKS5 constants
 SOCKS5_VERSION = 5
 NO_AUTH = 0
 CMD_CONNECT = 1
@@ -17,18 +15,13 @@ CMD_UDP_ASSOCIATE = 3
 
 ATYP_IPV4 = 1
 ATYP_DOMAIN = 3
-ATYP_IPV6 = 4
 
-REP_SUCCESS = 0
-REP_FAIL = 1
-
-
-# ================= UDP RELAY =================
+# ================= UDP =================
 
 class UDPRelay(DatagramProtocol):
     def __init__(self):
         self.client_addr = None
-        self.nat = {}  # (ip, port) -> client
+        self.nat = {}
 
     def datagramReceived(self, data, addr):
         try:
@@ -37,18 +30,18 @@ class UDPRelay(DatagramProtocol):
                 log.msg(f"[UDP] Client: {addr}")
 
             if addr == self.client_addr:
-                self.from_client(data)
+                self.handle_client(data)
             else:
-                self.from_remote(data, addr)
+                self.handle_remote(data, addr)
 
         except Exception as e:
             log.msg(f"[UDP ERROR] {e}")
 
-    def from_client(self, data):
+    def handle_client(self, data):
         if len(data) < 10:
             return
 
-        rsv, frag, atyp = struct.unpack("!HBB", data[:4])
+        _, frag, atyp = struct.unpack("!HBB", data[:4])
         if frag != 0:
             return
 
@@ -62,38 +55,24 @@ class UDPRelay(DatagramProtocol):
             offset += 1
             dst_addr = data[offset:offset+ln].decode()
             offset += ln
-        elif atyp == ATYP_IPV6:
-            dst_addr = socket.inet_ntop(socket.AF_INET6, data[offset:offset+16])
-            offset += 16
         else:
             return
 
         dst_port = struct.unpack("!H", data[offset:offset+2])[0]
         payload = data[offset+2:]
 
-        # NAT
         self.nat[(dst_addr, dst_port)] = self.client_addr
-
         self.transport.write(payload, (dst_addr, dst_port))
-        log.msg(f"[UDP] → {dst_addr}:{dst_port} ({len(payload)}B)")
 
-    def from_remote(self, data, addr):
+        log.msg(f"[UDP] → {dst_addr}:{dst_port}")
+
+    def handle_remote(self, data, addr):
         client = self.nat.get(addr)
-
         if not client:
-            log.msg(f"[UDP] Unknown remote {addr}")
             return
 
-        try:
-            addr_bytes = socket.inet_aton(addr[0])
-            atyp = ATYP_IPV4
-        except:
-            atyp = ATYP_DOMAIN
-            addr_bytes = bytes([len(addr[0])]) + addr[0].encode()
-
-        header = struct.pack("!HBB", 0, 0, atyp)
-        header += addr_bytes
-        header += struct.pack("!H", addr[1])
+        addr_bytes = socket.inet_aton(addr[0])
+        header = struct.pack("!HBB", 0, 0, 1) + addr_bytes + struct.pack("!H", addr[1])
 
         self.transport.write(header + data, client)
         log.msg(f"[UDP] ← {addr}")
@@ -106,7 +85,7 @@ class Remote(Protocol):
         self.client = client
 
     def connectionMade(self):
-        self.client.transport.write(self.client.reply_success())
+        self.client.transport.write(self.client.reply())
         log.msg("[TCP] Connected")
 
     def dataReceived(self, data):
@@ -120,7 +99,6 @@ class SOCKS5(Protocol):
     def __init__(self):
         self.state = 0
         self.buffer = b''
-        self.remote = None
 
     def dataReceived(self, data):
         self.buffer += data
@@ -136,7 +114,7 @@ class SOCKS5(Protocol):
             if len(self.buffer) < 7:
                 return
 
-            ver, cmd, _, atyp = struct.unpack("!BBBB", self.buffer[:4])
+            _, cmd, _, atyp = struct.unpack("!BBBB", self.buffer[:4])
             offset = 4
 
             if atyp == ATYP_IPV4:
@@ -158,7 +136,7 @@ class SOCKS5(Protocol):
                 self.connect(addr, port)
 
             elif cmd == CMD_UDP_ASSOCIATE:
-                self.udp_associate()
+                self.udp()
 
             self.buffer = b''
 
@@ -172,16 +150,16 @@ class SOCKS5(Protocol):
 
         reactor.connectTCP(host, port, factory)
 
-    def udp_associate(self):
+    def udp(self):
         relay = UDPRelay()
         port = reactor.listenUDP(0, relay)
         p = port.getHost().port
 
-        log.msg(f"[UDP] Started on {p}")
+        log.msg(f"[UDP] START {p}")
 
-        self.transport.write(self.reply_success("0.0.0.0", p))
+        self.transport.write(self.reply("0.0.0.0", p))
 
-    def reply_success(self, host="0.0.0.0", port=0):
+    def reply(self, host="0.0.0.0", port=0):
         return struct.pack("!BBBB", 5, 0, 0, 1) + socket.inet_aton(host) + struct.pack("!H", port)
 
 
@@ -193,17 +171,32 @@ class SOCKSFactory(Factory):
 
 # ================= MAIN =================
 
+def start_server(port):
+    try:
+        reactor.listenTCP(port, SOCKSFactory())
+        return port
+    except:
+        return None
+
+
 if __name__ == "__main__":
     log.startLogging(sys.stdout)
 
-    PORT = 1080
+    ports = [1098, 1081, 1082, 1083]
 
-    reactor.listenTCP(PORT, SOCKSFactory())
+    used_port = None
+    for p in ports:
+        if start_server(p):
+            used_port = p
+            break
+
+    if not used_port:
+        log.msg("❌ No free ports!")
+        sys.exit(1)
 
     log.msg("="*50)
-    log.msg("SOCKS5 + UDP (iSH READY)")
-    log.msg(f"PORT: {PORT}")
-    log.msg("Supports Discord / TeamSpeak")
+    log.msg("SOCKS5 + UDP (FIXED iSH)")
+    log.msg(f"PORT: {used_port}")
     log.msg("="*50)
 
     reactor.run()
