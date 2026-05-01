@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from twisted.internet import reactor, endpoints
-from twisted.internet.protocol import Protocol, Factory, ClientFactory
+from twisted.internet.protocol import Protocol, Factory, ClientFactory, DatagramProtocol
 from twisted.python import log
 
 import struct
@@ -16,6 +16,7 @@ SOCKS5_VERSION = 5
 NO_AUTH = 0
 
 CMD_CONNECT = 1
+CMD_UDP_ASSOCIATE = 3
 
 ATYP_IPV4 = 1
 ATYP_DOMAIN = 3
@@ -31,6 +32,7 @@ class ConnState(Enum):
     INIT = 0
     READY = 1
     RELAY = 2
+    UDP = 3
 
 
 def build_reply(rep, addr="0.0.0.0", port=0):
@@ -44,12 +46,88 @@ def build_reply(rep, addr="0.0.0.0", port=0):
     return struct.pack("!BBBB", SOCKS5_VERSION, rep, 0, atyp) + packed + struct.pack("!H", port)
 
 
+# =========================
+# UDP RELAY
+# =========================
+
+class UDPRelay(DatagramProtocol):
+    def __init__(self):
+        self.client_addr = None
+
+    def datagramReceived(self, data, addr):
+        if self.client_addr is None:
+            self.client_addr = addr
+            log.msg(f"[UDP] client {addr}")
+
+        if addr == self.client_addr:
+            self.handle_client(data)
+        else:
+            self.handle_remote(data, addr)
+
+    def handle_client(self, data):
+        try:
+            rsv, frag, atyp = struct.unpack("!HBB", data[:4])
+            if frag != 0:
+                return
+
+            offset = 4
+
+            if atyp == ATYP_IPV4:
+                dst = socket.inet_ntoa(data[offset:offset+4])
+                offset += 4
+
+            elif atyp == ATYP_DOMAIN:
+                ln = data[offset]
+                offset += 1
+                dst = data[offset:offset+ln].decode()
+                offset += ln
+
+            elif atyp == ATYP_IPV6:
+                dst = socket.inet_ntop(socket.AF_INET6, data[offset:offset+16])
+                offset += 16
+
+            else:
+                return
+
+            port = struct.unpack("!H", data[offset:offset+2])[0]
+            payload = data[offset+2:]
+
+            self.transport.write(payload, (dst, port))
+
+        except Exception as e:
+            log.msg(f"[UDP] error {e}")
+
+    def handle_remote(self, data, addr):
+        try:
+            try:
+                addr_bytes = socket.inet_aton(addr[0])
+                atyp = ATYP_IPV4
+            except:
+                addr_bytes = socket.inet_pton(socket.AF_INET6, addr[0])
+                atyp = ATYP_IPV6
+
+            header = struct.pack("!HBB", 0, 0, atyp)
+            header += addr_bytes
+            header += struct.pack("!H", addr[1])
+
+            packet = header + data
+            self.transport.write(packet, self.client_addr)
+
+        except Exception as e:
+            log.msg(f"[UDP] error {e}")
+
+
+# =========================
+# MAIN SERVER
+# =========================
+
 class SOCKS5Server(Protocol):
 
     def __init__(self):
         self.state = ConnState.INIT
         self.buffer = b''
         self.remote: Optional[Protocol] = None
+        self.udp_port = None
 
     def connectionMade(self):
         peer = self.transport.getPeer()
@@ -77,24 +155,20 @@ class SOCKS5Server(Protocol):
                 break
 
     # =====================
-    # FIXED HANDSHAKE
+    # HANDSHAKE
     # =====================
 
     def handle_greeting(self):
         if len(self.buffer) < 2:
             return False
 
-        version, nmethods = struct.unpack("!BB", self.buffer[:2])
+        ver, nmethods = struct.unpack("!BB", self.buffer[:2])
 
         if len(self.buffer) < 2 + nmethods:
             return False
 
-        methods = self.buffer[2:2 + nmethods]
-        self.buffer = self.buffer[2 + nmethods:]
-
-        if version != SOCKS5_VERSION:
-            self.transport.loseConnection()
-            return False
+        methods = self.buffer[2:2+nmethods]
+        self.buffer = self.buffer[2+nmethods:]
 
         if NO_AUTH in methods:
             self.transport.write(struct.pack("!BB", SOCKS5_VERSION, NO_AUTH))
@@ -114,7 +188,7 @@ class SOCKS5Server(Protocol):
             return False
 
         try:
-            version, cmd, _, atyp = struct.unpack("!BBBB", self.buffer[:4])
+            ver, cmd, _, atyp = struct.unpack("!BBBB", self.buffer[:4])
             offset = 4
 
             if atyp == ATYP_IPV4:
@@ -143,10 +217,34 @@ class SOCKS5Server(Protocol):
 
         self.buffer = b''
 
-        log.msg(f"[REQ] {addr}:{port}")
+        if cmd == CMD_CONNECT:
+            reactor.connectTCP(addr, port, RemoteFactory(self))
 
-        reactor.connectTCP(addr, port, RemoteFactory(self))
+        elif cmd == CMD_UDP_ASSOCIATE:
+            self.start_udp()
+
+        else:
+            self.transport.write(build_reply(REP_GENERAL_FAILURE))
+
         return True
+
+    # =====================
+    # UDP SUPPORT
+    # =====================
+
+    def start_udp(self):
+        relay = UDPRelay()
+        port = reactor.listenUDP(0, relay)
+        udp_port = port.getHost().port
+
+        log.msg(f"[UDP] listening {udp_port}")
+
+        self.transport.write(build_reply(REP_SUCCESS, "0.0.0.0", udp_port))
+        self.state = ConnState.UDP
+
+    # =====================
+    # TCP RELAY
+    # =====================
 
     def start_relay(self, remote):
         self.remote = remote
@@ -159,6 +257,10 @@ class SOCKS5Server(Protocol):
         if self.remote:
             self.remote.loseConnection()
 
+
+# =====================
+# REMOTE
+# =====================
 
 class RemoteFactory(ClientFactory):
     def __init__(self, server):
@@ -188,10 +290,18 @@ class RemoteClient(Protocol):
             self.server.transport.loseConnection()
 
 
+# =====================
+# FACTORY
+# =====================
+
 class SOCKSFactory(Factory):
     def buildProtocol(self, addr):
         return SOCKS5Server()
 
+
+# =====================
+# MAIN
+# =====================
 
 def main():
     log.startLogging(sys.stdout)
@@ -199,7 +309,7 @@ def main():
     port = 1080
     endpoint = endpoints.TCP4ServerEndpoint(reactor, port)
 
-    log.msg(f"SOCKS5 running on :{port}")
+    log.msg(f"SOCKS5 + UDP running on :{port}")
 
     endpoint.listen(SOCKSFactory())
     reactor.run()
